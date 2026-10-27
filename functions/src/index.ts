@@ -17,11 +17,6 @@ admin.initializeApp();
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "http://localhost:5173";
 const PARTICIPANTS = "participants";
 
-type ProgramState = {
-  started: boolean;
-  matches_final: boolean;
-};
-
 function buildNumericScoreRanges(form: any): Record<string, { min: number; max: number }> {
   const scoreRanges: Record<string, { min: number; max: number }> = {};
   const usedKeys = new Set<string>();
@@ -135,9 +130,10 @@ export const upsertUser = onRequest(async (req, res) => {
     const hasText = textResponses && textResponses.length > 0;
     const hasNumeric = numericResponses && Object.keys(numericResponses).length > 0;
 
-    // If there are no matchable responses, just return success
+    // If there are no matchable responses, fail to avoid assigning a
+    // matchable role without any vector data.
     if (!hasText && !hasNumeric) {
-      res.status(200).json({ message: "No responses to upsert." });
+      res.status(400).json({ error: "At least one matchable response is required." });
       return;
     }
 
@@ -189,12 +185,13 @@ export const addToWaitlist = onRequest(async (req, res) => {
     });
 
     // Upsert their data to Pinecone for potential matching
-    if ((textResponses && textResponses.length > 0) || 
-        (numericResponses && numericResponses.length > 0)) {
+    const hasText = textResponses && textResponses.length > 0;
+    const hasNumeric = numericResponses && Object.keys(numericResponses).length > 0;
+    if (hasText || hasNumeric) {
       await upsertFreeResponse(
         uid,
         textResponses || [],
-        numericResponses || [],
+        numericResponses || {},
         user_type,
         pronouns
       );

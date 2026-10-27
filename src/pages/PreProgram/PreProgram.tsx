@@ -8,12 +8,14 @@ import AutorenewIcon from "@mui/icons-material/Autorenew";
 import { auth, db, getUser, matchAll } from "../../firebase";
 import {
   collection,
+  deleteField,
   deleteDoc,
   doc,
   getDocs,
   query,
   serverTimestamp,
   setDoc,
+  type WriteBatch,
   updateDoc,
   where,
   writeBatch,
@@ -38,6 +40,7 @@ import ParticipantInfoPopup from "../Dashboard/components/ParticipantInfoPopup/P
 
 const DEFAULT_APPROVAL_THRESHOLD = 0.8; // 80%
 const DEV_MODE = true; // ← flip to false before deploying to production
+const FIRESTORE_BATCH_WRITE_LIMIT = 500;
 
 // Collections to wipe on End Program
 const COLLECTIONS_TO_CLEAR = [
@@ -258,7 +261,7 @@ const PreProgram = () => {
     const matchedIds = new Set<string>();
 
     if (!snap.empty) {
-      const pairRows: UI_Match[] = await Promise.all(
+      const pairRows: Array<UI_Match | null> = await Promise.all(
         snap.docs.map(async (d) => {
           const data = d.data() as {
             participant1_id?: string;
@@ -271,11 +274,16 @@ const PreProgram = () => {
           const p2 = data.participant2_id ?? "";
           const similarity = data.similarity ?? 0;
 
+          const [u1, u2] = await Promise.all([
+            getUser(p1).catch(() => null),
+            getUser(p2).catch(() => null),
+          ]);
+          if (!u1 || !u2) {
+            return null;
+          }
+
           matchedIds.add(p1);
           matchedIds.add(p2);
-
-          const u1 = await getUser(p1);
-          const u2 = await getUser(p2);
 
           const rawStatus = (data.status as string | undefined) || "";
           const approvalThreshold = programState?.autoApprovalThreshold ?? 80;
@@ -310,7 +318,7 @@ const PreProgram = () => {
         }),
       );
 
-      loadedPairs.push(...pairRows);
+      loadedPairs.push(...pairRows.filter((row): row is UI_Match => row !== null));
     }
 
     // Now find any participants with NO match at all (like rematching page)
@@ -390,16 +398,25 @@ const PreProgram = () => {
     return "low";
   };
 
+  const commitBatchOperations = async (
+    operations: Array<(batch: WriteBatch) => void>,
+  ) => {
+    for (let i = 0; i < operations.length; i += FIRESTORE_BATCH_WRITE_LIMIT) {
+      const batch = writeBatch(db);
+      operations
+        .slice(i, i + FIRESTORE_BATCH_WRITE_LIMIT)
+        .forEach((operation) => operation(batch));
+      await batch.commit();
+    }
+  };
+
   const storeMatches = async (list: UI_Match[]): Promise<UI_Match[]> => {
     const colRef = collection(db, "matches");
-
-    // Delete all existing match docs
     const existingDocs = await getDocs(colRef);
-    const deleteBatch = writeBatch(db);
-    existingDocs.forEach((d) => deleteBatch.delete(d.ref));
-    await deleteBatch.commit();
-
-    const writeBatchRef = writeBatch(db);
+    const deleteOperations = existingDocs.docs.map(
+      (matchDoc) => (batch: WriteBatch) => batch.delete(matchDoc.ref),
+    );
+    const setOperations: Array<(batch: WriteBatch) => void> = [];
     const withIds: UI_Match[] = [];
 
     list.forEach((m) => {
@@ -410,18 +427,31 @@ const PreProgram = () => {
       }
 
       const newDocRef = doc(colRef);
-      writeBatchRef.set(newDocRef, {
-        participant1_id: m.participant1_id,
-        participant2_id: m.participant2_id,
-        similarity: m.confidence,
-        status: m.status === "Approved" ? "approved" : "pending",
-        approvedBy: m.approvedBy ?? "",
-      });
+      setOperations.push((batch: WriteBatch) =>
+        batch.set(newDocRef, {
+          participant1_id: m.participant1_id,
+          participant2_id: m.participant2_id,
+          similarity: m.confidence,
+          status: m.status === "Approved" ? "approved" : "pending",
+          approvedBy: m.approvedBy ?? "",
+        }),
+      );
 
       withIds.push({ ...m, matchId: newDocRef.id });
     });
 
-    await writeBatchRef.commit();
+    const totalOperations = deleteOperations.length + setOperations.length;
+    if (totalOperations <= FIRESTORE_BATCH_WRITE_LIMIT) {
+      const batch = writeBatch(db);
+      [...deleteOperations, ...setOperations].forEach((operation) =>
+        operation(batch),
+      );
+      await batch.commit();
+    } else {
+      await commitBatchOperations(deleteOperations);
+      await commitBatchOperations(setOperations);
+    }
+
     console.log("Matches stored successfully.");
     return withIds;
   };
@@ -705,9 +735,33 @@ const PreProgram = () => {
       // Delete all docs in each collection (Firestore has no "delete collection" API)
       for (const colName of COLLECTIONS_TO_CLEAR) {
         const snap = await getDocs(collection(db, colName));
-        const batch = writeBatch(db);
-        snap.docs.forEach((d) => batch.delete(d.ref));
-        await batch.commit();
+        const operations: Array<(batch: WriteBatch) => void> = [];
+
+        if (colName === "participants") {
+          snap.docs.forEach((participantDoc) => {
+            const role = String(participantDoc.data()?.role ?? "")
+              .trim()
+              .toLowerCase();
+            if (role === "admin" || role === "subadmin" || role === "sub-admin") {
+              if (role === "subadmin" || role === "sub-admin") {
+                operations.push((batch: WriteBatch) =>
+                  batch.update(participantDoc.ref, {
+                    user_type: deleteField(),
+                    userType: deleteField(),
+                  }),
+                );
+              }
+              return;
+            }
+            operations.push((batch: WriteBatch) => batch.delete(participantDoc.ref));
+          });
+        } else {
+          snap.docs.forEach((collectionDoc) => {
+            operations.push((batch: WriteBatch) => batch.delete(collectionDoc.ref));
+          });
+        }
+
+        await commitBatchOperations(operations);
       }
 
       // Reset config doc

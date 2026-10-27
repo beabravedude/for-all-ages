@@ -41,8 +41,7 @@ async function getWaitlistedIds(): Promise<Set<string>> {
     return waitlistedIds;
   } catch (error) {
     logger.error('Error fetching waitlisted IDs:', error);
-    // Return empty set if fetch fails, to allow matching to continue
-    return new Set();
+    throw new Error('Failed to fetch waitlisted IDs from Firebase');
   }
 }
 

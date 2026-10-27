@@ -669,6 +669,13 @@ const RegistrationNew = ({
 
         // Extract matchable responses for Pinecone
         const { textResponses, numericResponses } = extractMatchableResponses(formData, form);
+        const hasMatchableResponses =
+          textResponses.length > 0 || Object.keys(numericResponses).length > 0;
+
+        if (computedUserType !== null && !hasMatchableResponses) {
+          setSubmitError("Please answer at least one matchable question before submitting.");
+          return;
+        }
 
         // Check if documents exist to determine if we need to set createdAt
         const participantDocRef = doc(db, "participants", participantId);
