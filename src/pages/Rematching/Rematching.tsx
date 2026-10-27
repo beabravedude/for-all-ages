@@ -12,6 +12,8 @@ import {
   doc,
   getDoc,
   getDocs,
+  increment,
+  runTransaction,
   writeBatch,
 } from "firebase/firestore";
 import { auth, db, computeMatchScore, getUser } from "../../firebase";
@@ -521,12 +523,39 @@ export default function Rematching() {
         approvedBy: adminName,
       });
 
-      // Remove waitlisted participants from the waitlist collection
-      const waitlistRef = collection(db, "waitlist");
-      batch.delete(doc(waitlistRef, selectedStudent.id));
-      batch.delete(doc(waitlistRef, selectedAdult.id));
-
       await batch.commit();
+
+      await runTransaction(db, async (transaction) => {
+        const studentWaitlistRef = doc(db, "waitlist", selectedStudent.id);
+        const adultWaitlistRef = doc(db, "waitlist", selectedAdult.id);
+
+        const [studentWaitlistSnap, adultWaitlistSnap] = await Promise.all([
+          transaction.get(studentWaitlistRef),
+          transaction.get(adultWaitlistRef),
+        ]);
+
+        let promotedCount = 0;
+
+        if (studentWaitlistSnap.exists()) {
+          transaction.delete(studentWaitlistRef);
+          promotedCount += 1;
+        }
+
+        if (adultWaitlistSnap.exists()) {
+          transaction.delete(adultWaitlistRef);
+          promotedCount += 1;
+        }
+
+        if (promotedCount > 0) {
+          const programStateRef = doc(db, "config", "programState");
+          transaction.set(
+            programStateRef,
+            { currentParticipants: increment(promotedCount) },
+            { merge: true },
+          );
+        }
+      });
+
       setSelectedStudent(null);
       setSelectedAdult(null);
       await loadData();
